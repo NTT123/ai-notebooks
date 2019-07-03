@@ -1,0 +1,322 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "name": "A Ring Attractor Network.ipynb",
+      "version": "0.3.2",
+      "provenance": [],
+      "collapsed_sections": [],
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/NTT123/ai-notebooks/blob/master/Train_A_Ring_Attractor_Network_V2.ipynb%09\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "WbQPkmt2c72N",
+        "colab_type": "text"
+      },
+      "source": [
+        "### Parameters"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "pP-iRGrQSYxe",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "num_time_step=100    #  steps for each trial\n",
+        "total_variance=10    # \n",
+        "unit_circle=10.0     # \n",
+        "num_neuron=128       #  artifical neurons\n",
+        "num_direction=16     #  discretized directions\n",
+        "num_batch=2_000\n",
+        "batch_size=128\n",
+        "max_grad_norm=1.0\n",
+        "step = 0_000\n",
+        "dropout_prob=0.1\n",
+        "lr=1e-3\n",
+        "weight_decay=1e-4"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "AePm07Kne1DU",
+        "colab_type": "text"
+      },
+      "source": [
+        "### Tensorboard"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "eOgtYgQte2Os",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "# !pip install -q tf-nightly-2.0-preview\n",
+        "%load_ext tensorboard \n",
+        "%tensorboard --logdir ./logs --port 1246"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "thYCBjtAYzFS",
+        "colab_type": "text"
+      },
+      "source": [
+        "### Model"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "FW7x9KImYz9x",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import numpy as np\n",
+        "import math\n",
+        "\n",
+        "## run model on cpu or gpu\n",
+        "device= torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+        "\n",
+        "def generate_batch(batch_size):\n",
+        "    sample_size =batch_size\n",
+        "    head_actions = []  # left or right\n",
+        "\n",
+        "    std = math.sqrt(total_variance / num_time_step)\n",
+        "    bias = torch.randn(sample_size) * std\n",
+        "\n",
+        "    for i in range(num_time_step):\n",
+        "        act = torch.randn( sample_size ) * std + bias\n",
+        "        head_actions.append( act )\n",
+        "\n",
+        "    head_actions = torch.stack(head_actions, dim=1)    \n",
+        "    head_direction = torch.cumsum(head_actions, dim=1) \n",
+        "    \n",
+        "    head_direction = torch.floor(torch.remainder(head_direction, unit_circle) / (unit_circle+1e-5) * num_direction)\n",
+        "    head_direction = head_direction.long()\n",
+        "    \n",
+        "    return head_actions, head_direction\n",
+        "\n",
+        "# recurrent neural network\n",
+        "rnn= nn.GRUCell(input_size=1, hidden_size=num_neuron).to(device)\n",
+        "\n",
+        "dropout = nn.Dropout(p=dropout_prob)\n",
+        "# read out signal from rnn\n",
+        "read_out = nn.Sequential(\n",
+        "    nn.Linear(in_features=num_neuron, out_features=num_direction, bias=True),\n",
+        "#     nn.ReLU(),\n",
+        "#     nn.Dropout(p=dropout_prob),\n",
+        "#     nn.Linear(in_features=32, out_features=num_direction, bias=True)\n",
+        ").to(device)\n",
+        "\n",
+        "# the initial state of the dynamics\n",
+        "h_0 = nn.parameter.Parameter(torch.randn(1, num_neuron, requires_grad=True).to(device))"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Qcgw5dOvZpL_",
+        "colab_type": "text"
+      },
+      "source": [
+        "### Train"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "lelPOp_wnxsy",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "from torch.utils.tensorboard import SummaryWriter\n",
+        "writer = SummaryWriter(log_dir=\"./logs/rnn/1\")\n",
+        "\n",
+        "from itertools import chain\n",
+        "from torch.nn.utils import clip_grad_norm_\n",
+        "from google.colab import output\n",
+        "\n",
+        "\n",
+        "params = chain(rnn.parameters(), read_out.parameters(), [h_0])\n",
+        "optimizer = torch.optim.Adam(params=params, lr=lr, weight_decay=weight_decay)\n",
+        "loss_fn = nn.CrossEntropyLoss()\n",
+        "\n",
+        "# scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer,base_lr)\n",
+        "\n",
+        "rnn = rnn.to(device)\n",
+        "read_out = read_out.to(device)\n",
+        "\n",
+        "for i in range(step, step+num_batch):\n",
+        "    \n",
+        "    x, y = generate_batch(batch_size)\n",
+        "    x = x.to(device)\n",
+        "    y = y.to(device)\n",
+        "    h = h_0.repeat(batch_size, 1)\n",
+        "    \n",
+        "    loss = 0.0\n",
+        "    \n",
+        "    for t in range(num_time_step):\n",
+        "        h = dropout(rnn(x[:, t].unsqueeze(1), h))        \n",
+        "        output = read_out(h)\n",
+        "        loss += loss_fn(output, y[:, t])\n",
+        "    \n",
+        "    loss = loss / num_time_step\n",
+        "    optimizer.zero_grad()\n",
+        "    loss.backward()\n",
+        "    clip_grad_norm_(params, max_grad_norm)\n",
+        "    optimizer.step()\n",
+        "#     scheduler.step()\n",
+        "\n",
+        "    writer.add_scalar(\"loss\", loss.item(), i) \n",
+        "    print(\"\\r {}\".format(i*100.0 / num_batch),end=\"\")"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "mrTMRlr9pEMr",
+        "colab_type": "text"
+      },
+      "source": [
+        "### Find fixed points"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "nXeVGc6Xz_qi",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "import matplotlib.pyplot as plt\n",
+        "plt.matshow(  rnn.weight_hh.data.cpu().t().numpy()  )\n",
+        "_ = plt.colorbar()"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "jTc4lRFZ8Uvb",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "rnn = rnn.to(device).eval()\n",
+        "read_out = read_out.to(device).eval()"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "zUc2VSannOUy",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "hs = []\n",
+        "os = []\n",
+        "\n",
+        "with torch.no_grad():\n",
+        "    for i in range(3):\n",
+        "\n",
+        "        h = h_0.repeat(batch_size, 1).to(device)\n",
+        "        x, y = generate_batch(batch_size)\n",
+        "        x = x.to(device)\n",
+        "\n",
+        "        for t in range(num_time_step):\n",
+        "            h = rnn(x[:, t].unsqueeze(1).to(device), h)\n",
+        "            hs.append(h)\n",
+        "            output = read_out(h)\n",
+        "            os.append(output)\n",
+        "            \n",
+        "hs = torch.cat(hs, dim=0)\n",
+        "os = torch.cat(os, dim=0)\n",
+        "\n",
+        "hss = hs\n",
+        "hss += torch.randn_like(hss) * 0.1\n",
+        "x = torch.zeros(hss.size(0), 1).to(device)\n",
+        "with torch.no_grad():\n",
+        "    for s in range(100):\n",
+        "        hss = rnn(x, hss)\n",
+        "        \n",
+        "mycolor1 = torch.argmax(read_out(hs), dim=1).data.cpu().numpy()\n",
+        "mycolor2 = torch.argmax(read_out(hss), dim=1).data.cpu().numpy()"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "_wInTZpis3GV",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "writer.add_embedding(hs.data.cpu().numpy(), metadata=mycolor1, global_step=4, tag=\"raw\")\n",
+        "writer.add_embedding(hss.data.cpu().numpy(), metadata=mycolor2, global_step=3, tag=\"fixed point\")"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "_AzAOM-bSV1H",
+        "colab_type": "code",
+        "colab": {}
+      },
+      "source": [
+        "# !pip install -q tf-nightly-2.0-preview\n",
+        "%load_ext tensorboard \n",
+        "%tensorboard --logdir ./logs --port 1247"
+      ],
+      "execution_count": 0,
+      "outputs": []
+    }
+  ]
+}
